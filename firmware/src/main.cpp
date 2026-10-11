@@ -11,6 +11,9 @@
  *      (OpenAI 兼容 /v1/chat/completions) 的地址 / Key / 模型名均可在
  *      网页配置并持久化。默认留空, 首次上电在网页填写 (例如 llama.cpp
  *      的 OpenAI 兼容服务)。
+ *   4. 引脚控制: 网页面板直接操作, 或在 AI 对话里用自然语言说
+ *      ("让引脚 5 高电平持续 2 秒" / "让 LED 闪烁"), 模型按约定协议
+ *      输出 [PIN]{...}[/PIN] 指令, 固件解析执行并在回复中反馈结果。
  *
  * ============ 历史「坑」的根因(务必保留此注释) ============
  * - board = esp01_1m -> variant generic -> LED_BUILTIN 被定义为 1,
@@ -77,10 +80,46 @@ String cfgApiUrl   = DEF_API_URL;
 String cfgApiKey   = DEF_API_KEY;
 String cfgApiModel = DEF_API_MODEL;
 
-static uint8_t       g_ledMode       = 0;  // 0=心跳闪烁 1=常亮 2=常灭
+// ---------------- 引脚控制 (页面 + AI 对话共用) ----------------
+// ESP8266 有 GPIO 0..16。本模块 (ESP-01) 可用输出引脚: 2,3,4,5,15,16
+//   0  = flash 片选 CS, 驱动低电平会关掉 flash 导致芯片崩溃
+//   1  = UART TXD, 动了就废掉串口输出
+//   2  = 板载 LED (低电平点亮)
+//   16 = RTC 引脚, 只能输出不能读
+//   6..14 = flash 数据/时钟引脚或本模块未引出
+enum { PIN_IDLE = 0, PIN_HIGH, PIN_LOW, PIN_BLINK, PIN_HEARTBEAT };
+
+struct PinCtl {
+  uint8_t  mode;        // PIN_*
+  bool     level;       // 当前电平 (闪烁翻转用)
+  uint32_t intervalMs;  // 闪烁翻转间隔
+  uint32_t untilMs;     // 非 0: 到点自动恢复低电平 (PIN_HIGH/PIN_BLINK)
+  uint32_t lastToggle;  // 上次翻转的 millis()
+};
+static PinCtl g_pins[17];
+
+static const bool PIN_OK[17] = {
+  false, false, true, true, true, true,   // 0..5
+  false, false, false, false, false,      // 6..10
+  false, false, false, false,             // 11..14
+  true, true                              // 15,16
+};
+static const char *PIN_NOTES[17] = {
+  "是 flash 片选(CS), 驱动会使芯片崩溃",
+  "是串口 TXD, 控制会打乱串口输出",
+  "板载 LED", "", "", "",
+  "flash 数据引脚", "flash 数据引脚", "flash 引脚",
+  "本模块未引出", "本模块未引出",
+  "flash 数据引脚", "flash 数据引脚", "flash 数据引脚", "flash 时钟引脚",
+  "", "只能输出, 不能读取"
+};
+
+static void pinApply(uint8_t pin, uint8_t mode, uint32_t intervalMs, uint32_t untilMs);
+static String execPinCmd(const String &json);
+static void pinTick();
+
 static unsigned long g_bootMs        = 0;
 static unsigned long g_lastBeat      = 0;
-static unsigned long g_lastLed       = 0;
 static bool          g_ledLevel      = false;
 static bool          g_staConnecting = false;  // 页面发起的连接请求进行中
 static unsigned long g_staT0         = 0;
@@ -192,9 +231,35 @@ border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:9px}
       <button id="sendBtn" onclick="doSend()">发送</button>
     </div>
   </div>
+
+  <div class="panel">
+    <h2>③ 引脚控制 (也可以直接在上面的 AI 对话里说)</h2>
+    <div class="row">
+      <select id="pinSel" style="padding:9px 12px;border-radius:11px;border:1px solid #2b4568;background:#0e1929;color:#e8eef7">
+        <option value="2">引脚 2 (板载 LED)</option>
+        <option value="3">引脚 3</option>
+        <option value="4">引脚 4</option>
+        <option value="5">引脚 5</option>
+        <option value="15">引脚 15</option>
+        <option value="16">引脚 16 (只能输出)</option>
+      </select>
+      <button onclick="pinDo('high')">高电平</button>
+      <button onclick="pinDo('low')">低电平</button>
+      <button onclick="pinDo('blink')">闪烁</button>
+      <button onclick="pinDo('off')">关闭</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <input id="pinInt" type="number" value="500" min="20" max="30000" placeholder="闪烁间隔 ms" style="width:140px">
+      <input id="pinDur" type="number" min="100" max="3600000" placeholder="持续 ms (空=保持)" style="width:180px">
+      <span style="font-size:12px;color:#7f97b3">持续时间到点后自动恢复低电平</span>
+    </div>
+    <div class="hint">当前状态: <span id="pinState" style="color:#8fe3b1">—</span><br>
+    AI 对话里也可以直接说: "让引脚 5 高电平持续 2 秒"、"让 LED 每 300 毫秒闪一次"、"关闭 LED"、"恢复 LED 心跳"。
+    引脚 0 是 flash 片选、引脚 1 是串口 TX, 驱动会使芯片崩溃/打乱串口, 已锁定; 6~14 本模块未引出或为 flash 引脚。</div>
+  </div>
 </div>
 <script>
-var hist=[{role:'system',content:'你是一个运行在 ESP8266 小硬件上的简洁助手, 请用中文简短回答。'}];
+var hist=[{role:'system',content:'你是一个运行在 ESP8266 小硬件上的简洁助手, 可以用自然语言控制板子引脚(高/低电平、闪烁、LED 状态), 请用中文简短回答。'}];
 function el(id){return document.getElementById(id);}
 function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function fmt(s){var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
@@ -213,7 +278,8 @@ function refresh(){
    b.classList.remove('hidden');
   } else {b.classList.add('hidden');}
  }).catch(function(){el('sub').textContent='连接中断, 重试中…';});
-}
+ refreshPins();
+}}
 function doScan(){
  el('netlist').innerHTML='<div class="hint" style="padding:6px">正在扫描… (约 3 秒)</div>';
  fetch('/api/wifi/scan').then(function(r){return r.json()}).then(function(j){
@@ -240,6 +306,31 @@ function doDisconnect(){
  fetch('/api/wifi/disconnect',{method:'POST'}).then(function(r){return r.json()}).then(function(j){
   if(j.error){alert(j.error);}
  }).catch(function(){alert('请求失败');});
+}
+function pinDo(action){
+ var pin=el('pinSel').value;
+ var iv=parseInt(el('pinInt').value)||500;
+ var du=parseInt(el('pinDur').value)||0;
+ var body='pin='+pin+'&action='+action+'&interval_ms='+iv+'&duration_ms='+du;
+ fetch('/api/pin',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})
+ .then(function(r){return r.json()}).then(function(j){
+   if(j.error){alert(j.error);} else {refreshPins();}
+ }).catch(function(){alert('请求失败');});
+}
+function refreshPins(){
+ fetch('/api/pins').then(function(r){return r.json()}).then(function(j){
+   var names={high:'高电平',low:'低电平',blink:'闪烁',heartbeat:'心跳闪烁'};
+   var act=[];
+   Object.keys(j.pins).forEach(function(p){
+     var v=j.pins[p],i=v.indexOf(':');
+     var m=i>=0?v.substring(0,i):v;
+     if(m==='idle'){return;}
+     var s='pin'+p+'='+(names[m]||m);
+     if(m==='blink'&&i>=0){s+=' @'+v.substring(i+1)+'ms';}
+     act.push(s);
+   });
+   el('pinState').textContent=act.length?act.join(', '):'无活动引脚';
+ }).catch(function(){});
 }
 function loadCfg(){
  fetch('/api/chat/config').then(function(r){return r.json()}).then(function(j){
@@ -337,7 +428,7 @@ static void sendStatus() {
   json += "\",\"mode\":\"";
   json += (staOk ? "APSTA" : "AP");
   json += "\",\"led\":";
-  json += String((unsigned)g_ledMode);
+  json += String((unsigned)g_pins[LED_PIN].mode);
   json += ",\"ssid\":\"";
   jsonEsc(ssid, json);
   json += "\",\"wifi\":\"";
@@ -348,7 +439,10 @@ static void sendStatus() {
 
 static void handleLed() {
   if (server.hasArg("mode")) {
-    g_ledMode = (uint8_t)constrain(server.arg("mode").toInt(), 0, 2);
+    int m = (int)constrain(server.arg("mode").toInt(), 0, 2);
+    if (m == 0) pinApply(LED_PIN, PIN_HEARTBEAT, 0, 0);
+    else if (m == 1) pinApply(LED_PIN, PIN_HIGH, 0, 0);
+    else pinApply(LED_PIN, PIN_LOW, 0, 0);
   }
   sendStatus();
 }
@@ -460,6 +554,26 @@ static void handleChatConfigSet() {
   handleChatConfigGet();  // 返回保存后的配置
 }
 
+// ---------------- AI 引脚控制指令协议 ----------------
+// 服务端在 messages 数组最前面注入这条协议系统消息 (客户端自带的那条
+// system 保留, 两条 system 并存对模型无害)。要求模型在需要控制引脚时
+// 输出一行 [PIN]{...}[/PIN] 指令, 本固件解析执行并在回复中反馈结果。
+static const char PIN_PROTOCOL[] PROGMEM =
+  "你是 ESP8266 开发板的控制助手, 可以通过文字控制板子引脚。 "
+  "可操作的引脚: 2 (板载LED), 3, 4, 5, 15, 16 (其中 16 只能输出)。 "
+  "当用户要求操作引脚(输出高/低电平、保持一段时间、闪烁、LED 常亮/闪烁/关闭/心跳)时, "
+  "你的回复中必须包含一行控制指令, 格式为: "
+  "[PIN]{\"pin\":引脚号,\"action\":\"high|low|blink|off|heartbeat\",\"interval_ms\":闪烁翻转间隔毫秒,\"duration_ms\":保持毫秒}[/PIN] "
+  "然后再用一句简短中文说明。 "
+  "规则: "
+  "1) action 含义: high=输出高电平, low/off=输出低电平(off 等同 low), blink=闪烁, heartbeat=仅 pin2 恢复 1Hz 心跳闪烁; "
+  "2) 用户指定了持续时间(如 \"2秒\"、\"1.5秒\")时必须填 duration_ms(单位毫秒), 到时自动恢复低电平; 未指定则省略该字段; "
+  "3) blink 的 interval_ms 为翻转间隔, 缺省 500, 范围 20~30000; "
+  "4) 用户要求列表之外的引脚时, 说明该引脚不可操作, 不要输出 [PIN] 指令; "
+  "5) 指令是否执行成功以系统反馈为准, 不要假装已执行; "
+  "6) 与引脚控制无关的问题正常回答, 不要输出 [PIN] 指令。 "
+  "请用中文简短回答。";
+
 // ---------------- AI 对话转发 ----------------
 static void handleChat() {
   String history = server.arg("history");  // JSON 数组: [{role,content},...]
@@ -478,11 +592,20 @@ static void handleChat() {
   }
 
   String fullUrl = cfgApiUrl + "/chat/completions";
+  // messages = [协议 system, ...客户端历史...]。纯字符串拼接, 不解析 JSON,
+  // 省掉一份文档的堆开销; 客户端自带的 system 消息原样保留。
   String body = "{\"model\":\"";
   jsonEsc(cfgApiModel, body);
-  body += "\",\"messages\":";
-  body += history;
-  body += ",\"stream\":false,\"max_tokens\":512}";
+  body += "\",\"messages\":[{";
+  body += "\"role\":\"system\",\"content\":\"";
+  jsonEsc(PIN_PROTOCOL, body);
+  body += "\"},";
+  if (history.length() >= 2 && history[0] == '[' && history[history.length() - 1] == ']') {
+    body += history.substring(1, history.length() - 1);
+  } else {
+    body += history;
+  }
+  body += "],\"stream\":false,\"max_tokens\":512}";
 
   HTTPClient http;
   WiFiClient httpClient;
@@ -546,6 +669,40 @@ static void handleChat() {
   body = String();
   history = String();
 
+  // 解析并执行模型回复里的引脚控制指令
+  {
+    int s = reply.indexOf("[PIN]");
+    int e2 = (s >= 0) ? reply.indexOf("[/PIN]", s) : -1;
+    if (s >= 0 && e2 > s) {
+      String cmd = reply.substring(s + 5, e2);
+      int cut = e2 + 6;
+      if (cut < (int)reply.length() && reply[cut] == '\n') cut++;
+      reply = reply.substring(0, s) + reply.substring(cut);  // 去掉指令行本身
+      reply += execPinCmd(cmd);
+    } else {
+      // 兜底: 模型没带标记但回复里有含 pin 和 action 的 JSON 对象,
+      // 取第一个 { ... } 尝试执行
+      int a = reply.indexOf("\"pin\"");
+      int b = reply.indexOf("\"action\"");
+      if (a >= 0 && b >= 0) {
+        int brace = reply.lastIndexOf('{', min(a, b));
+        if (brace >= 0) {
+          int depth = 0, end = -1;
+          for (int i = brace; i < (int)reply.length(); i++) {
+            if (reply[i] == '{') depth++;
+            else if (reply[i] == '}') {
+              depth--;
+              if (depth == 0) { end = i + 1; break; }
+            }
+          }
+          if (end > brace) {
+            reply += execPinCmd(reply.substring(brace, end));
+          }
+        }
+      }
+    }
+  }
+
   // 输出 JSON 手工拼装 (ArduinoJson v6 的 JsonDocument 是抽象类, 且再分配
   // 一份文档会白占 ~4KB 堆)
   String outStr;
@@ -564,15 +721,188 @@ static void ledWrite(bool on) {
   digitalWrite(LED_PIN, (on != LED_ACTIVE_LOW) ? HIGH : LOW);
 }
 
-static void ledTick() {
-  if (g_ledMode == 1) {
-    ledWrite(true);
-  } else if (g_ledMode == 2) {
-    ledWrite(false);
-  } else if (millis() - g_lastLed >= 500) {  // 心跳: 500ms 翻转 => 1Hz
-    g_lastLed = millis();
-    ledWrite(!g_ledLevel);
+// ---------------- 引脚控制实现 ----------------
+static void pinApply(uint8_t pin, uint8_t mode, uint32_t intervalMs, uint32_t untilMs) {
+  PinCtl &c = g_pins[pin];
+  if (pin != LED_PIN) pinMode(pin, OUTPUT);
+  c.mode = mode;
+  c.intervalMs = (mode == PIN_HEARTBEAT) ? 500UL : intervalMs;
+  c.untilMs = untilMs;
+  c.lastToggle = millis();
+  if (mode == PIN_HIGH) {
+    c.level = true;
+    if (pin == LED_PIN) ledWrite(true); else digitalWrite(pin, HIGH);
+  } else if (mode == PIN_LOW || mode == PIN_IDLE) {
+    c.level = false;
+    if (pin == LED_PIN) ledWrite(false); else digitalWrite(pin, LOW);
+  } else {  // PIN_BLINK / PIN_HEARTBEAT: 从低电平起, 间隔到后翻转
+    c.level = false;
   }
+}
+
+// loop() 里调用: 非阻塞地驱动所有引脚 (闪烁翻转 / 心跳 / 到时恢复)
+static void pinTick() {
+  for (int p = 0; p < 17; p++) {
+    PinCtl &c = g_pins[p];
+    if (c.mode == PIN_BLINK) {
+      if (c.untilMs && (long)(millis() - c.untilMs) >= 0) {
+        pinApply(p, PIN_LOW, 0, 0);  // 到时: 停闪恢复低电平
+      } else if ((long)(millis() - c.lastToggle) >= (long)c.intervalMs) {
+        c.lastToggle = millis();
+        c.level = !c.level;
+        if (p == LED_PIN) ledWrite(c.level);
+        else digitalWrite(p, c.level ? HIGH : LOW);
+      }
+    } else if (c.mode == PIN_HEARTBEAT) {
+      if (millis() - c.lastToggle >= 500UL) {  // 1Hz 心跳
+        c.lastToggle = millis();
+        c.level = !c.level;
+        ledWrite(c.level);
+      }
+    } else if (c.mode == PIN_HIGH && c.untilMs && (long)(millis() - c.untilMs) >= 0) {
+      pinApply(p, PIN_LOW, 0, 0);  // 到时: 恢复低电平
+    }
+  }
+}
+
+// 解析并执行一条引脚控制指令 JSON, 返回给调用方展示的反馈文本 (以 "\n\n" 开头)
+static String execPinCmd(const String &json) {
+  String out;
+  out.reserve(128);
+  DynamicJsonDocument doc(384);
+  if (deserializeJson(doc, json) || !doc.is<JsonObject>()) {
+    out = "\n\n⚠️ 指令解析失败: 不是合法的 JSON";
+    Serial.println(out);
+    return out;
+  }
+  int pin = doc["pin"] | -1;
+  String action = doc["action"] | "";
+  if (pin < 0 || pin > 16) {
+    out = "\n\n⚠️ 指令无效: 引脚号超出范围 (0~16)";
+    Serial.println(out);
+    return out;
+  }
+  if (!PIN_OK[pin]) {
+    out = "\n\n⚠️ 引脚 ";
+    out += String(pin);
+    out += " 不可操作: ";
+    out += PIN_NOTES[pin];
+    Serial.println(out);
+    return out;
+  }
+  uint32_t interval = doc["interval_ms"] | 500UL;
+  if (interval < 20) interval = 20;
+  if (interval > 30000) interval = 30000;
+  uint32_t dur = doc["duration_ms"] | 0UL;
+  if (dur > 3600000) dur = 3600000;
+  uint32_t until = dur ? (millis() + dur) : 0;
+
+  const char *name = (pin == LED_PIN) ? "板载 LED" : "引脚";
+  if (action == "high") {
+    pinApply(pin, PIN_HIGH, 0, until);
+    out = "\n\n⚡ 已执行: ";
+    out += name;
+    out += String(pin);
+    out += " 高电平";
+    if (dur) {
+      out += " (约 ";
+      out += dur;
+      out += " ms 后自动恢复低电平)";
+    }
+  } else if (action == "low" || action == "off") {
+    pinApply(pin, PIN_LOW, 0, 0);
+    out = "\n\n⚡ 已执行: ";
+    out += name;
+    out += String(pin);
+    out += " 低电平";
+  } else if (action == "blink") {
+    pinApply(pin, PIN_BLINK, interval, until);
+    out = "\n\n⚡ 已执行: ";
+    out += name;
+    out += String(pin);
+    out += " 闪烁 (每 ";
+    out += interval;
+    out += " ms 翻转一次";
+    if (dur) {
+      out += ", 约 ";
+      out += dur;
+      out += " ms 后停止";
+    }
+    out += ")";
+  } else if (action == "heartbeat") {
+    if (pin != LED_PIN) {
+      out = "\n\n⚠️ 心跳闪烁 (heartbeat) 只对 pin 2 (板载 LED) 可用";
+      Serial.println(out);
+      return out;
+    }
+    pinApply(pin, PIN_HEARTBEAT, 0, 0);
+    out = "\n\n⚡ 已执行: 板载 LED 恢复 1Hz 心跳闪烁";
+  } else {
+    out = "\n\n⚠️ 未知动作: ";
+    out += action;
+    out += " (只支持 high / low / blink / off / heartbeat)";
+    Serial.println(out);
+    return out;
+  }
+  Serial.println(out);
+  return out;
+}
+
+// POST /api/pin  pin=&action=high|low|blink|off|heartbeat&interval_ms=&duration_ms=
+static void handlePinSet() {
+  int pin = server.arg("pin").toInt();
+  String action = server.arg("action");
+  long interval = server.arg("interval_ms").toInt();
+  long dur = server.arg("duration_ms").toInt();
+
+  String json;
+  json.reserve(96);
+  json = "{\"pin\":";
+  json += String(pin);
+  json += ",\"action\":\"";
+  json += action;
+  json += "\"";
+  if (interval > 0) {
+    json += ",\"interval_ms\":";
+    json += String(interval);
+  }
+  if (dur > 0) {
+    json += ",\"duration_ms\":";
+    json += String(dur);
+  }
+  json += "}";
+
+  String res = execPinCmd(json);
+  bool ok = res.startsWith("\n\n⚡");
+  String out;
+  out.reserve(res.length() + 48);
+  out = ok ? "{\"ok\":true,\"result\":\"" : "{\"ok\":false,\"error\":\"";
+  String body = res.substring(3);  // 去掉开头的 "\n\n"
+  jsonEsc(body, out);
+  out += "\"}";
+  server.send(ok ? 200 : 400, "application/json", out);
+}
+
+// GET /api/pins -> {"pins":{"0":"idle","2":"heartbeat",...,"15":"blink:500"}}
+static void handlePinsGet() {
+  static const char *MODE_NAMES[5] = {"idle", "high", "low", "blink", "heartbeat"};
+  String json;
+  json.reserve(180);
+  json = "{\"pins\":{";
+  for (int p = 0; p < 17; p++) {
+    if (p) json += ",";
+    json += "\"";
+    json += String(p);
+    json += "\":\"";
+    json += MODE_NAMES[g_pins[p].mode];
+    if (g_pins[p].mode == PIN_BLINK) {
+      json += ":";
+      json += String(g_pins[p].intervalMs);
+    }
+    json += "\"";
+  }
+  json += "}}";
+  server.send(200, "application/json", json);
 }
 
 // ---------------- 启动 ----------------
@@ -637,6 +967,7 @@ void setup() {
 
   pinMode(LED_PIN, OUTPUT);
   ledWrite(false);
+  pinApply(LED_PIN, PIN_HEARTBEAT, 0, 0);  // 默认 1Hz 心跳
 
   Serial.println();
   Serial.println("================================================");
@@ -671,6 +1002,8 @@ void setup() {
   server.on("/api/chat", HTTP_POST, handleChat);
   server.on("/api/chat/config", HTTP_GET, handleChatConfigGet);
   server.on("/api/chat/config", HTTP_POST, handleChatConfigSet);
+  server.on("/api/pin", HTTP_POST, handlePinSet);
+  server.on("/api/pins", HTTP_GET, handlePinsGet);
   server.onNotFound(handleNotFound);
   server.begin();
 
@@ -681,7 +1014,7 @@ void setup() {
 void loop() {
   server.handleClient();
   MDNS.update();
-  ledTick();
+  pinTick();
 
   // 网页发起的 STA 连接: 20s 超时看门狗 (非阻塞)
   if (g_staConnecting) {
@@ -703,7 +1036,7 @@ void loop() {
     Serial.printf("[beat] uptime=%lus heap=%u rssi=%d ip=%s led=%u\n",
                   (unsigned long)((millis() - g_bootMs) / 1000UL),
                   (unsigned)ESP.getFreeHeap(), staOk ? (int)WiFi.RSSI() : -1,
-                  ip.c_str(), (unsigned)g_ledMode);
+                  ip.c_str(), (unsigned)g_pins[LED_PIN].mode);
   }
   delay(2);
 }
