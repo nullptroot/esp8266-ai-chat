@@ -1,0 +1,23 @@
+# PlatformIO
+.pio/
+.pio-cache/
+venv/
+
+# 构建产物
+*.bin
+*.elf
+*.hex
+*.map
+
+# 串口日志
+serial_*.txt
+boot*.txt
+eeprom_*.bin
+
+# Python
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store
+Thumbs.db
