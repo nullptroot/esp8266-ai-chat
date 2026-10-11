@@ -41,7 +41,7 @@ pio run
 
 - platform：`espressif8266@4.2.1`，framework：`arduinoespressif8266@3.30102.0`（自动安装）
 - 依赖：`bblanchon/ArduinoJson@6.21.4`（`lib_deps` 自动拉取）
-- 产物：`firmware/.pio/build/esp01_1m/firmware.bin`
+- 产物：`firmware/.pio/build/esp8266/firmware.bin`（PlatformIO env 名是 `esp8266`，board 才是 `esp01_1m`）
 
 参考占用：RAM ≈ 40%（32.9KB/81.9KB），Flash ≈ 48%（363KB/744KB）。
 

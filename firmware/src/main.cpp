@@ -279,7 +279,7 @@ function refresh(){
   } else {b.classList.add('hidden');}
  }).catch(function(){el('sub').textContent='连接中断, 重试中…';});
  refreshPins();
-}}
+}
 function doScan(){
  el('netlist').innerHTML='<div class="hint" style="padding:6px">正在扫描… (约 3 秒)</div>';
  fetch('/api/wifi/scan').then(function(r){return r.json()}).then(function(j){
